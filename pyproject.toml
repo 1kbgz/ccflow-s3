@@ -80,6 +80,7 @@ branch = true
 omit = [
     "ccflow_s3/tests/integration/",
 ]
+
 [tool.coverage.report]
 exclude_also = [
     "raise NotImplementedError",

@@ -33,6 +33,7 @@ dependencies = [
     "boto3",
     "botocore",
     "ccflow>=0.6.10",
+    "ccflow-etl",
 ]
 
 [project.optional-dependencies]
@@ -114,6 +115,11 @@ addopts = [
     "--junitxml=junit.xml",
 ]
 testpaths = "ccflow_s3/tests"
+markers = [
+    "integration: cross-package tests using only local synthetic fixtures",
+    "e2e: complete local workflow tests using only synthetic fixtures and local storage",
+    "live: tests requiring live provider credentials or external infrastructure",
+]
 
 [tool.ruff]
 line-length = 150

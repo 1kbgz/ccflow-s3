@@ -33,7 +33,7 @@ dependencies = [
     "boto3",
     "botocore",
     "ccflow>=0.6.10",
-    "ccflow-etl",
+    "ccflow-etl>=0.1.1",
 ]
 
 [project.optional-dependencies]

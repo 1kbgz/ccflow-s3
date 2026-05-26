@@ -1,9 +1,6 @@
-from csv import DictReader, DictWriter
 from datetime import datetime, timezone
-from gzip import compress, decompress
-from io import BytesIO, StringIO
 from json import dumps
-from typing import Any, Dict, List, Literal, Optional, TypeVar, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import quote
 
 from boto3 import Session
@@ -12,18 +9,11 @@ from botocore.exceptions import ClientError
 from ccflow import (
     BaseModel,
     CallableModel,
-    ContextBase,
-    DateContext,
-    DateRangeContext,
-    DatetimeContext,
-    DatetimeRangeContext,
     Flow,
     GenericResult,
     NullContext,
-    ResultBase,
 )
-from ccflow_etl import CheckpointRecord, CheckpointStatus
-from jinja2 import Environment, Template
+from ccflow_etl import CacheFormat, CheckpointRecord, CheckpointStatus, PayloadCodec
 
 try:
     from orjson import loads
@@ -59,10 +49,6 @@ __all__ = (
     "S3WriteResult",
     "S3Model",
 )
-
-ResultFormat = Literal["binary", "text", "json", "csv", "parquet", "gzip"]
-Context = TypeVar("C", bound=ContextBase)
-Result = TypeVar("R", bound=ResultBase)
 
 
 class S3Config(BaseModel):
@@ -117,19 +103,6 @@ class S3Client(BaseModel):
 class S3Context(NullContext):
     bucket: Optional[str] = None
     object: Optional[str] = None
-    # TODO: format?
-
-
-class S3DateContext(S3Context, DateContext): ...
-
-
-class S3DatetimeContext(S3Context, DatetimeContext): ...
-
-
-class S3DateRangeContext(S3Context, DateRangeContext): ...
-
-
-class S3DatetimeRangeContext(S3Context, DatetimeRangeContext): ...
 
 
 class S3ReadContext(S3Context): ...
@@ -170,10 +143,6 @@ class S3WriteContext(S3Context):
 
 class S3WriteDataContext(S3WriteContext):
     data: Union[bytes, str, dict, List[Dict[str, Any]]]
-
-
-class S3WriteFileContext(S3WriteContext):
-    file: str
 
 
 class S3ReadWriteContext(S3Context):
@@ -226,10 +195,16 @@ class S3CacheStore(BaseModel):
     bucket: str
     prefix: str = ""
 
-    def _object_key(self, key: str) -> str:
+    def object_key(self, key: str) -> str:
         clean_prefix = self.prefix.strip("/")
         clean_key = key.lstrip("/")
         return f"{clean_prefix}/{clean_key}" if clean_prefix else clean_key
+
+    def uri(self, key: str) -> str:
+        return f"s3://{self.bucket}/{self.object_key(key)}"
+
+    def _object_key(self, key: str) -> str:
+        return self.object_key(key)
 
     def exists(self, key: str) -> bool:
         try:
@@ -250,12 +225,6 @@ class S3CacheStore(BaseModel):
             kwargs["ContentType"] = content_type
         response = self.client.client.put_object(**kwargs)
         return {"bucket": self.bucket, "object": self._object_key(key), "etag": response.get("ETag")}
-
-    def get_json(self, key: str) -> Any:
-        return loads(self.get_bytes(key))
-
-    def put_json(self, key: str, value: Any) -> Dict[str, Any]:
-        return self.put_bytes(key, dumps(value, separators=(",", ":")).encode("utf-8"), content_type="application/json")
 
 
 class S3CheckpointStore(BaseModel):
@@ -301,48 +270,22 @@ class S3CheckpointStore(BaseModel):
         return record is not None and record.status == "succeeded"
 
 
-# class S3Model(CallableModelGenericType[S3Context, S3Result]):
 class S3Model(CallableModel):
     bucket: Optional[str] = None
     object: Optional[str] = None
     client: S3Client
 
     mode: Literal["read", "write", "read_write", "exists", "head", "list", "prefix_walk", "copy", "delete"] = "read"
-    format: Union[ResultFormat, List[ResultFormat]] = "binary"
+    format: CacheFormat = "binary"
 
-    def _formats(self) -> List[ResultFormat]:
-        return [self.format] if not isinstance(self.format, list) else self.format
-
-    def template(self) -> Template:
-        # Loads object as a Jinja2 template
-        return Environment().from_string(self.object)
+    @property
+    def codec(self) -> PayloadCodec:
+        return PayloadCodec(format=self.format)
 
     def _read_data(self, client: S3Client, bucket: str, object: str) -> S3ReadResult:
         read_response = client.client.get_object(Bucket=bucket, Key=object)
 
-        # Read as binary
-        read_data = read_response["Body"].read()
-
-        formats = self._formats()
-
-        for format in formats:
-            match format:
-                case "binary":
-                    pass  # already binary
-                case "gzip":
-                    read_data = decompress(read_data)
-                case "text":
-                    read_data = read_data.decode("utf-8")
-                case "json":
-                    read_data = loads(read_data)
-                case "csv":
-                    text = read_data.decode("utf-8") if isinstance(read_data, bytes) else str(read_data)
-                    read_data = list(DictReader(StringIO(text)))
-                case "parquet":
-                    read_data = self._read_parquet(read_data)
-                case _:
-                    raise ValueError(f"Unsupported result format: {format}")
-        return S3ReadResult(value=read_data)
+        return S3ReadResult(value=self.codec.decode(read_response["Body"].read()))
 
     def _object_exists(self, client: S3Client, bucket: str, object: str) -> bool:
         try:
@@ -372,10 +315,7 @@ class S3Model(CallableModel):
         if page_size:
             kwargs["MaxKeys"] = page_size
         response = client.client.list_objects_v2(**kwargs)
-        objects = [
-            {"key": item.get("Key"), "size": item.get("Size"), "etag": item.get("ETag")}
-            for item in response.get("Contents", [])
-        ]
+        objects = [{"key": item.get("Key"), "size": item.get("Size"), "etag": item.get("ETag")} for item in response.get("Contents", [])]
         return S3ListResult(value={"bucket": bucket, "prefix": prefix, "objects": objects})
 
     def _walk_objects(self, client: S3Client, bucket: str, prefix: str, page_size: Optional[int] = None) -> S3ListResult:
@@ -388,10 +328,7 @@ class S3Model(CallableModel):
             if page_size:
                 kwargs["MaxKeys"] = page_size
             response = client.client.list_objects_v2(**kwargs)
-            objects.extend(
-                {"key": item.get("Key"), "size": item.get("Size"), "etag": item.get("ETag")}
-                for item in response.get("Contents", [])
-            )
+            objects.extend({"key": item.get("Key"), "size": item.get("Size"), "etag": item.get("ETag")} for item in response.get("Contents", []))
             if not response.get("IsTruncated"):
                 break
             continuation_token = response.get("NextContinuationToken")
@@ -424,76 +361,17 @@ class S3Model(CallableModel):
         response = client.client.delete_object(Bucket=bucket, Key=object)
         return S3DeleteResult(value={"bucket": bucket, "object": object, "deleted": True, "delete_marker": response.get("DeleteMarker")})
 
-    def _read_parquet(self, data: bytes) -> Any:
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            raise ImportError("Parquet reads require pandas with a parquet engine such as pyarrow or fastparquet.") from exc
-        return pd.read_parquet(BytesIO(data))
-
-    def _write_csv(self, data: Union[dict, List[Dict[str, Any]]]) -> bytes:
-        rows = data if isinstance(data, list) else [data]
-        if not rows:
-            return b""
-        buffer = StringIO()
-        writer = DictWriter(buffer, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-        return buffer.getvalue().encode("utf-8")
-
-    def _write_parquet(self, data: Any) -> bytes:
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            raise ImportError("Parquet writes require pandas with a parquet engine such as pyarrow or fastparquet.") from exc
-        dataframe = data if hasattr(data, "to_parquet") else pd.DataFrame(data)
-        buffer = BytesIO()
-        dataframe.to_parquet(buffer, index=False)
-        return buffer.getvalue()
-
     def _write_body(self, data: Union[bytes, str, dict, List[Dict[str, Any]]]) -> bytes:
-        formats = self._formats()
-        if "parquet" in formats:
-            body = self._write_parquet(data)
-        elif "csv" in formats:
-            if not isinstance(data, (dict, list)):
-                raise TypeError("CSV writes require a dict row or list of dict rows.")
-            body = self._write_csv(data)
-        elif "json" in formats:
-            body = dumps(data, separators=(",", ":")).encode("utf-8")
-        elif isinstance(data, bytes):
-            body = data
-        elif isinstance(data, str):
-            body = data.encode("utf-8")
-        else:
-            body = dumps(data, separators=(",", ":")).encode("utf-8")
-
-        if "gzip" in formats:
-            body = compress(body)
-        return body
-
-    def _legacy_write_body(self, data: Union[bytes, str, dict]) -> bytes:
-        if isinstance(data, bytes):
-            return data
-        if isinstance(data, str):
-            return data.encode("utf-8")
-        return dumps(data, separators=(",", ":")).encode("utf-8")
+        return self.codec.encode(data)
 
     def _content_type(self, context: S3WriteContext) -> Optional[str]:
         if context.content_type:
             return context.content_type
-        formats = self._formats()
-        if "parquet" in formats:
-            return "application/vnd.apache.parquet"
-        if "csv" in formats:
-            return "text/csv; charset=utf-8"
-        if "json" in formats:
-            return "application/json"
-        if "text" in formats:
-            return "text/plain; charset=utf-8"
-        return None
+        return self.codec.media_type
 
-    def _manifest_payload(self, bucket: str, object: str, body: bytes, content_type: Optional[str], etag: Optional[str], context: S3WriteContext) -> S3ObjectManifest:
+    def _manifest_payload(
+        self, bucket: str, object: str, body: bytes, content_type: Optional[str], etag: Optional[str], context: S3WriteContext
+    ) -> S3ObjectManifest:
         return S3ObjectManifest(
             bucket=bucket,
             object=object,
@@ -557,8 +435,6 @@ class S3Model(CallableModel):
 
     @Flow.call
     def __call__(self, context: S3Context) -> S3Result:
-        # TODO: specify retry policy
-        # Use the S3 client to get the object from S3
         if isinstance(context, S3ReadWriteContext):
             read_bucket = context.read.bucket or self.bucket
             read_object = context.read.object or self.object

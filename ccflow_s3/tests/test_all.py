@@ -3,8 +3,9 @@ from gzip import decompress
 
 import pytest
 from botocore.exceptions import ClientError
-from ccflow_etl import CheckpointRecord
+from ccflow_etl import CacheGetContext, CacheGetModel, CachePutContext, CachePutModel, CheckpointRecord
 
+import ccflow_s3.base as s3_base
 from ccflow_s3 import (
     S3CacheStore,
     S3CheckpointStore,
@@ -83,8 +84,17 @@ class FakeBody:
         return self.body
 
 
-def test_all():
-    assert True
+def test_release_surface_has_no_unimplemented_skeleton_models():
+    for name in (
+        "S3DateContext",
+        "S3DatetimeContext",
+        "S3DateRangeContext",
+        "S3DatetimeRangeContext",
+        "S3WriteFileContext",
+    ):
+        assert not hasattr(s3_base, name)
+
+    assert not hasattr(s3_base.S3Model, "template")
 
 
 def test_s3_model_checks_object_existence(monkeypatch):
@@ -92,7 +102,10 @@ def test_s3_model_checks_object_existence(monkeypatch):
     backend.objects[("bucket", "existing.json")] = {"Body": b"{}", "ETag": "etag"}
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
 
-    model = S3Model(client=S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret")), mode="exists")
+    model = S3Model(
+        client=S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret")),
+        mode="exists",
+    )
 
     assert model(S3ExistsContext(bucket="bucket", object="existing.json")).value is True
     assert model(S3ExistsContext(bucket="bucket", object="missing.json")).value is False
@@ -116,6 +129,41 @@ def test_s3_model_writes_json_without_overwriting_existing(monkeypatch):
     assert backend.objects[("bucket", "daily/AAA.json")]["Body"] == b'{"ticker":"AAA"}'
 
 
+def test_s3_model_delegates_format_conversion_to_payload_codec(monkeypatch):
+    backend = FakeS3Backend()
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    encode_calls = []
+    decode_calls = []
+
+    def encode(self, payload):
+        encode_calls.append((self.format, payload))
+        return b"encoded-by-codec"
+
+    def decode(self, payload):
+        decode_calls.append((self.format, payload))
+        return {"decoded": True}
+
+    monkeypatch.setattr("ccflow_s3.base.PayloadCodec.encode", encode)
+    monkeypatch.setattr("ccflow_s3.base.PayloadCodec.decode", decode)
+
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    model = S3Model(client=client, mode="write", format="json")
+    model(S3WriteDataContext(bucket="bucket", object="daily/AAA.json", data={"ticker": "AAA"}))
+    read_result = S3Model(client=client, mode="read", format="json")(S3ReadContext(bucket="bucket", object="daily/AAA.json"))
+
+    assert encode_calls == [("json", {"ticker": "AAA"})]
+    assert decode_calls == [("json", b"encoded-by-codec")]
+    assert backend.objects[("bucket", "daily/AAA.json")]["Body"] == b"encoded-by-codec"
+    assert read_result.value == {"decoded": True}
+
+
+def test_s3_cache_store_exposes_prefixed_object_keys_and_uris():
+    store = S3CacheStore(client=S3Client(), bucket="bucket", prefix="cache")
+
+    assert store.object_key("daily/AAA.json") == "cache/daily/AAA.json"
+    assert store.uri("daily/AAA.json") == "s3://bucket/cache/daily/AAA.json"
+
+
 def test_s3_model_heads_lists_and_copies_objects(monkeypatch):
     backend = FakeS3Backend()
     backend.objects[("bucket", "daily/AAA.json")] = {"Body": b'{"ticker":"AAA"}', "ContentType": "application/json", "ETag": "etag"}
@@ -124,7 +172,9 @@ def test_s3_model_heads_lists_and_copies_objects(monkeypatch):
 
     head = S3Model(client=client, mode="head")(S3HeadContext(bucket="bucket", object="daily/AAA.json"))
     listed = S3Model(client=client, mode="list")(S3ListContext(bucket="bucket", prefix="daily/"))
-    copied = S3Model(client=client, mode="copy")(S3CopyContext(bucket="bucket", object="archive/AAA.json", source_bucket="bucket", source_object="daily/AAA.json"))
+    copied = S3Model(client=client, mode="copy")(
+        S3CopyContext(bucket="bucket", object="archive/AAA.json", source_bucket="bucket", source_object="daily/AAA.json")
+    )
 
     assert head.value["content_length"] == len(b'{"ticker":"AAA"}')
     assert listed.value["objects"] == [{"key": "daily/AAA.json", "size": len(b'{"ticker":"AAA"}'), "etag": "etag"}]
@@ -163,6 +213,37 @@ def test_s3_model_atomic_write_records_manifest(monkeypatch):
     assert manifest["producer"] == {"model": "test"}
 
 
+def test_s3_model_atomic_write_copy_failure_preserves_existing_target_and_skips_manifest(monkeypatch):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "daily/AAA.json")] = {"Body": b'{"ticker":"OLD"}', "ContentType": "application/json", "ETag": "old-etag"}
+
+    def fail_copy_object(Bucket, Key, CopySource, ContentType=None):
+        raise ClientError({"Error": {"Code": "InternalError", "Message": "copy failed"}}, "CopyObject")
+
+    backend.copy_object = fail_copy_object
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    model = S3Model(
+        client=S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret")),
+        mode="write",
+        format="json",
+    )
+
+    with pytest.raises(ClientError):
+        model(
+            S3WriteDataContext(
+                bucket="bucket",
+                object="daily/AAA.json",
+                data={"ticker": "AAA"},
+                overwrite=True,
+                atomic=True,
+                manifest_object="manifests/daily/AAA.json",
+            )
+        )
+
+    assert backend.objects[("bucket", "daily/AAA.json")]["Body"] == b'{"ticker":"OLD"}'
+    assert ("bucket", "manifests/daily/AAA.json") not in backend.objects
+
+
 def test_s3_model_writes_and_reads_csv_and_gzip_json(monkeypatch):
     backend = FakeS3Backend()
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
@@ -198,7 +279,7 @@ def test_s3_model_read_write_context_reads_source_and_writes_destination(monkeyp
 
     assert result.read.value == {"ticker": "AAA"}
     assert result.write.value["status"] == "written"
-    assert backend.objects[("bucket", "normalized/AAA.json")]["Body"] == b'{"ticker":"AAA","normalized":true}'
+    assert backend.objects[("bucket", "normalized/AAA.json")]["Body"] == b'{"normalized":true,"ticker":"AAA"}'
 
 
 def test_s3_model_walks_prefix_pages_and_deletes_only_with_explicit_context(monkeypatch):
@@ -250,16 +331,35 @@ def test_s3_cache_and_checkpoint_adapters_use_s3_objects(monkeypatch):
     client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
 
     cache = S3CacheStore(client=client, bucket="bucket", prefix="cache")
-    cache.put_json("daily/AAA", {"ticker": "AAA"})
+    cache.put_bytes("daily/AAA", b'{"ticker":"AAA"}', content_type="application/json")
 
     checkpoint = S3CheckpointStore(client=client, bucket="bucket", prefix="checkpoints")
     record = checkpoint.mark_succeeded("daily/AAA", metadata={"rows": 1})
 
     assert cache.exists("daily/AAA") is True
-    assert cache.get_json("daily/AAA") == {"ticker": "AAA"}
+    assert cache.get_bytes("daily/AAA") == b'{"ticker":"AAA"}'
     assert isinstance(record, CheckpointRecord)
     assert checkpoint.should_skip("daily/AAA") is True
     assert checkpoint.get("daily/AAA").metadata == {"rows": 1}
+
+
+def test_s3_cache_store_works_with_generic_cache_models(monkeypatch):
+    backend = FakeS3Backend()
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+
+    store = S3CacheStore(client=client, bucket="bucket", prefix="cache")
+    put_model = CachePutModel(store=store, format="json")
+    get_model = CacheGetModel(store=store, format="json")
+
+    put_result = put_model(CachePutContext(key="daily/AAA", payload={"ticker": "AAA"}, dataset="stocks", stage="extract"))
+    get_result = get_model(CacheGetContext(key="daily/AAA", dataset="stocks", stage="extract"))
+
+    assert put_result.status == "written"
+    assert put_result.artifact.uri == "s3://bucket/cache/daily/AAA.json"
+    assert backend.objects[("bucket", "cache/daily/AAA.json")]["ContentType"] == "application/json"
+    assert get_result.status == "hit"
+    assert get_result.payload == {"ticker": "AAA"}
 
 
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):

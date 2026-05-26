@@ -1,0 +1,18 @@
+# @package cache
+
+store:
+  _target_: ccflow_s3.S3CacheStore
+  client:
+    _target_: ccflow_s3.S3Client
+  bucket: ""
+  prefix: cache
+
+put:
+  _target_: ccflow_etl.CachePutModel
+  store: /cache/store
+  format: json
+
+get:
+  _target_: ccflow_etl.CacheGetModel
+  store: /cache/store
+  format: json

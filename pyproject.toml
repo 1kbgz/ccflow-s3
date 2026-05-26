@@ -56,6 +56,9 @@ develop = [
 
 [project.scripts]
 
+[project.entry-points."hydra.lernaplugins"]
+ccflow-s3 = "pkg:ccflow_s3.config"
+
 [project.urls]
 Repository = "https://github.com/1kbgz/ccflow-s3"
 Homepage = "https://github.com/1kbgz/ccflow-s3"

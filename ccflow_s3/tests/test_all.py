@@ -1,9 +1,13 @@
 import json
 from gzip import decompress
+from pathlib import Path
 
 import pytest
+import tomllib
 from botocore.exceptions import ClientError
 from ccflow_etl import CacheGetContext, CacheGetModel, CachePutContext, CachePutModel, CheckpointRecord
+from hydra import compose, initialize_config_dir
+from hydra.utils import instantiate
 
 import ccflow_s3.base as s3_base
 from ccflow_s3 import (
@@ -95,6 +99,30 @@ def test_release_surface_has_no_unimplemented_skeleton_models():
         assert not hasattr(s3_base, name)
 
     assert not hasattr(s3_base.S3Model, "template")
+
+
+def test_s3_config_package_is_exposed_for_hydra_lerna_plugins(tmp_path):
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
+    assert pyproject["project"]["entry-points"]["hydra.lernaplugins"]["ccflow-s3"] == "pkg:ccflow_s3.config"
+
+    (tmp_path / "runner.yaml").write_text(
+        """
+defaults:
+    - _self_
+    - cache: s3
+    - checkpoint: s3
+
+hydra:
+    searchpath:
+        - pkg://ccflow_s3.config
+""".lstrip()
+    )
+
+    with initialize_config_dir(config_dir=str(tmp_path), version_base=None):
+        cfg = compose(config_name="runner")
+
+    assert isinstance(instantiate(cfg.cache.store), S3CacheStore)
+    assert isinstance(instantiate(cfg.checkpoint.store), S3CheckpointStore)
 
 
 def test_s3_model_checks_object_existence(monkeypatch):

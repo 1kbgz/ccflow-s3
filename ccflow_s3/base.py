@@ -13,7 +13,7 @@ from ccflow import (
     GenericResult,
     NullContext,
 )
-from ccflow_etl import CacheFormat, CheckpointRecord, CheckpointStatus, PayloadCodec
+from ccflow_etl import APIKeySecretCredentials, CacheFormat, CheckpointRecord, CheckpointStatus, PayloadCodec
 
 try:
     from orjson import loads
@@ -23,6 +23,7 @@ from pydantic import Field
 
 __all__ = (
     "S3Config",
+    "S3Credentials",
     "S3Session",
     "S3Client",
     "S3Context",
@@ -59,7 +60,13 @@ class S3Config(BaseModel):
         return Config(signature_version=self.signature_version)
 
 
+class S3Credentials(APIKeySecretCredentials):
+    api_key_env: Optional[str] = "AWS_ACCESS_KEY_ID"
+    secret_key_env: Optional[str] = "AWS_SECRET_ACCESS_KEY"
+
+
 class S3Session(BaseModel):
+    credentials: Optional[APIKeySecretCredentials] = None
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     aws_session_token: Optional[str] = None
@@ -67,9 +74,10 @@ class S3Session(BaseModel):
     region_name: Optional[str] = None
 
     def _session_kwargs(self, region_name: Optional[str] = None) -> Dict[str, str]:
+        credentials = self.credentials
         kwargs = {
-            "aws_access_key_id": self.aws_access_key_id,
-            "aws_secret_access_key": self.aws_secret_access_key,
+            "aws_access_key_id": self.aws_access_key_id or (credentials.resolved_api_key() if credentials else None),
+            "aws_secret_access_key": self.aws_secret_access_key or (credentials.resolved_secret_key() if credentials else None),
             "aws_session_token": self.aws_session_token,
             "profile_name": self.profile_name,
             "region_name": self.region_name or region_name,

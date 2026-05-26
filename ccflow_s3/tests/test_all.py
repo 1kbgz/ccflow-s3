@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import tomllib
 from botocore.exceptions import ClientError
-from ccflow_etl import CacheGetContext, CacheGetModel, CachePutContext, CachePutModel, CheckpointRecord
+from ccflow_etl import APIKeySecretCredentials, CacheGetContext, CacheGetModel, CachePutContext, CachePutModel, CheckpointRecord
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 
@@ -15,6 +15,7 @@ from ccflow_s3 import (
     S3CheckpointStore,
     S3Client,
     S3CopyContext,
+    S3Credentials,
     S3DeleteContext,
     S3ExistsContext,
     S3HeadContext,
@@ -351,6 +352,24 @@ def test_s3_session_and_client_support_aws_defaults_and_compatible_endpoints(mon
     assert calls[0]["session"] == {"profile_name": "analytics", "region_name": "us-east-1"}
     assert calls[1]["client"]["endpoint_url"] is None
     assert calls[3]["client"]["endpoint_url"] == "https://s3-compatible.example.test"
+
+
+def test_s3_session_accepts_generic_key_secret_credentials(monkeypatch):
+    monkeypatch.setenv("S3_TEST_KEY", "configured-key")
+    monkeypatch.setenv("S3_TEST_SECRET", "configured-secret")
+
+    session = S3Session(credentials=APIKeySecretCredentials(api_key_env="S3_TEST_KEY", secret_key_env="S3_TEST_SECRET"))
+
+    assert session._session_kwargs() == {"aws_access_key_id": "configured-key", "aws_secret_access_key": "configured-secret"}
+    assert S3Session(credentials=S3Credentials(api_key="key", secret_key="secret"))._session_kwargs() == {
+        "aws_access_key_id": "key",
+        "aws_secret_access_key": "secret",
+    }
+    assert S3Session(
+        credentials=APIKeySecretCredentials(api_key="credential-key", secret_key="credential-secret"),
+        aws_access_key_id="explicit-key",
+        aws_secret_access_key="explicit-secret",
+    )._session_kwargs() == {"aws_access_key_id": "explicit-key", "aws_secret_access_key": "explicit-secret"}
 
 
 def test_s3_cache_and_checkpoint_adapters_use_s3_objects(monkeypatch):

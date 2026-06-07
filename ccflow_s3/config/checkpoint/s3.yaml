@@ -1,8 +1,0 @@
-# @package checkpoint
-
-store:
-  _target_: ccflow_s3.S3CheckpointStore
-  client:
-    _target_: ccflow_s3.S3Client
-  bucket: ""
-  prefix: checkpoints

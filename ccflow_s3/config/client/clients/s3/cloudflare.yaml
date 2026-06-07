@@ -1,0 +1,15 @@
+# @package client
+
+_target_: ccflow_s3.S3Client
+provider:
+  _target_: ccflow_s3.S3Provider
+  name: cloudflare
+  endpoint_url_env: CLOUDFLARE_R2_ENDPOINT_URL
+  account_id_env: CLOUDFLARE_R2_ACCOUNT_ID
+  region_name: auto
+credentials:
+  _target_: ccflow_s3.S3ClientCredentials
+  mode: env
+  access_key_id_env: CLOUDFLARE_R2_ACCESS_KEY_ID
+  secret_access_key_env: CLOUDFLARE_R2_SECRET_ACCESS_KEY
+  region_name: auto

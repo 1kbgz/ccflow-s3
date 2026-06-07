@@ -1,0 +1,13 @@
+# @package client
+
+_target_: ccflow_s3.S3Client
+provider:
+  _target_: ccflow_s3.S3Provider
+  name: hetzner
+  endpoint_url_env: HETZNER_S3_ENDPOINT_URL
+  region_name_env: HETZNER_S3_REGION
+credentials:
+  _target_: ccflow_s3.S3ClientCredentials
+  mode: env
+  access_key_id_env: HETZNER_S3_ACCESS_KEY_ID
+  secret_access_key_env: HETZNER_S3_SECRET_ACCESS_KEY

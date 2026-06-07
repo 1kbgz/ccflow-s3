@@ -1,0 +1,10 @@
+# @package client
+
+_target_: ccflow_s3.S3Client
+provider:
+  _target_: ccflow_s3.S3Provider
+  name: aws
+  region_name_env: AWS_REGION
+credentials:
+  _target_: ccflow_s3.S3ClientCredentials
+  mode: default

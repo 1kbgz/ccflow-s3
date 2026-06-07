@@ -4,16 +4,25 @@ from pathlib import Path
 
 import pytest
 import tomllib
+from botocore import UNSIGNED
 from botocore.exceptions import ClientError
-from ccflow_etl import APIKeySecretCredentials, CacheGetContext, CacheGetModel, CachePutContext, CachePutModel, CheckpointRecord
+from ccflow_etl import (
+    APIKeySecretCredentials,
+    ArtifactWriteModel,
+    CacheGetContext,
+    CacheGetModel,
+    CachePutContext,
+    CachePutModel,
+)
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 
 import ccflow_s3.base as s3_base
 from ccflow_s3 import (
+    S3ArtifactStore,
     S3CacheStore,
-    S3CheckpointStore,
     S3Client,
+    S3ClientCredentials,
     S3CopyContext,
     S3Credentials,
     S3DeleteContext,
@@ -22,6 +31,7 @@ from ccflow_s3 import (
     S3ListContext,
     S3Model,
     S3PrefixWalkContext,
+    S3Provider,
     S3ReadContext,
     S3ReadWriteContext,
     S3Session,
@@ -72,8 +82,10 @@ class FakeS3Backend:
         self.objects[(Bucket, Key)] = {**source, "ContentType": ContentType or source.get("ContentType"), "ETag": "copy-etag"}
         return {"CopyObjectResult": {"ETag": "copy-etag"}}
 
-    def put_object(self, Bucket, Key, Body, ContentType=None):
-        self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType, "ETag": "etag"}
+    def put_object(self, Bucket, Key, Body, ContentType=None, Metadata=None):
+        if hasattr(Body, "read"):
+            Body = Body.read()
+        self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType, "Metadata": Metadata or {}, "ETag": "etag"}
         return {"ETag": "etag"}
 
     def delete_object(self, Bucket, Key):
@@ -104,14 +116,19 @@ def test_release_surface_has_no_unimplemented_skeleton_models():
 
 def test_s3_config_package_is_exposed_for_hydra_lerna_plugins(tmp_path):
     pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
+    config_root = Path(__file__).parents[1] / "config"
     assert pyproject["project"]["entry-points"]["hydra.lernaplugins"]["ccflow-s3"] == "pkg:ccflow_s3.config"
+    assert not (config_root / "s3_auth").exists()
+    assert not (config_root / "s3_provider").exists()
+    assert (config_root / "client" / "clients" / "s3" / "cloudflare.yaml").exists()
+    assert (config_root / "credentials" / "credentials" / "s3" / "cloudflare.yaml").exists()
 
     (tmp_path / "runner.yaml").write_text(
         """
 defaults:
     - _self_
     - cache: s3
-    - checkpoint: s3
+    - output: /outputs/s3
 
 hydra:
     searchpath:
@@ -123,7 +140,7 @@ hydra:
         cfg = compose(config_name="runner")
 
     assert isinstance(instantiate(cfg.cache.store), S3CacheStore)
-    assert isinstance(instantiate(cfg.checkpoint.store), S3CheckpointStore)
+    assert isinstance(instantiate(cfg.output), S3ArtifactStore)
 
 
 def test_s3_model_checks_object_existence(monkeypatch):
@@ -293,7 +310,7 @@ def test_s3_model_writes_and_reads_csv_and_gzip_json(monkeypatch):
     assert gzip_read.value == {"ticker": "AAA"}
 
 
-def test_s3_model_read_write_context_reads_source_and_writes_destination(monkeypatch):
+def test_s3_model_read_write_context_reads_source_and_writes_output(monkeypatch):
     backend = FakeS3Backend()
     backend.objects[("bucket", "raw/AAA.json")] = {"Body": b'{"ticker":"AAA"}', "ContentType": "application/json", "ETag": "etag"}
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
@@ -354,6 +371,121 @@ def test_s3_session_and_client_support_aws_defaults_and_compatible_endpoints(mon
     assert calls[3]["client"]["endpoint_url"] == "https://s3-compatible.example.test"
 
 
+def test_s3_provider_resolves_common_s3_backend_endpoints(monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_R2_ACCOUNT_ID", "account-id")
+    monkeypatch.setenv("HETZNER_S3_REGION", "fsn1")
+    monkeypatch.setenv("BACKBLAZE_S3_REGION", "us-west-004")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-2")
+
+    assert S3Provider(name="aws", region_name="us-east-1").resolved_endpoint_url() is None
+    assert S3Provider(name="aws").resolved_region_name() == "us-east-2"
+    assert S3Provider(name="backblaze", region_name="us-east-005").resolved_endpoint_url() == "https://s3.us-east-005.backblazeb2.com"
+    assert S3Provider(name="backblaze", region_name_env="BACKBLAZE_S3_REGION").resolved_endpoint_url() == "https://s3.us-west-004.backblazeb2.com"
+    assert S3Provider(name="hetzner", region_name_env="HETZNER_S3_REGION").resolved_endpoint_url() == "https://fsn1.your-objectstorage.com"
+    assert S3Provider(name="cloudflare", account_id_env="CLOUDFLARE_R2_ACCOUNT_ID").resolved_endpoint_url() == (
+        "https://account-id.r2.cloudflarestorage.com"
+    )
+    assert S3Provider(name="cloudflare", account_id="account-id").resolved_region_name() == "auto"
+    assert S3Provider(name="custom", endpoint_url="https://objects.example.test").resolved_endpoint_url() == "https://objects.example.test"
+
+    with pytest.raises(ValueError, match="custom requires endpoint_url"):
+        S3Provider(name="custom").resolved_endpoint_url()
+
+
+def test_s3_client_credentials_resolve_env_profile_credentials_and_anonymous_mode(monkeypatch):
+    monkeypatch.setenv("S3_TEST_KEY", "configured-key")
+    monkeypatch.setenv("S3_TEST_SECRET", "configured-secret")
+    monkeypatch.setenv("S3_TEST_TOKEN", "configured-token")
+    monkeypatch.setenv("S3_TEST_REGION", "configured-region")
+
+    env_credentials = S3ClientCredentials(
+        mode="env",
+        access_key_id_env="S3_TEST_KEY",
+        secret_access_key_env="S3_TEST_SECRET",
+        session_token_env="S3_TEST_TOKEN",
+        region_name_env="S3_TEST_REGION",
+    )
+    profile_credentials = S3ClientCredentials(mode="profile", profile_name="analytics", region_name="us-east-1")
+    nested_credentials = S3ClientCredentials(mode="credentials", credentials=APIKeySecretCredentials(api_key="key", secret_key="secret"))
+
+    assert env_credentials.session_kwargs() == {
+        "aws_access_key_id": "configured-key",
+        "aws_secret_access_key": "configured-secret",
+        "aws_session_token": "configured-token",
+        "region_name": "configured-region",
+    }
+    assert profile_credentials.session_kwargs() == {"profile_name": "analytics", "region_name": "us-east-1"}
+    assert nested_credentials.session_kwargs() == {"aws_access_key_id": "key", "aws_secret_access_key": "secret"}
+    assert S3ClientCredentials(mode="anonymous").session_kwargs(region_name="us-east-1") == {}
+    assert S3ClientCredentials(mode="anonymous").is_anonymous is True
+
+
+def test_s3_client_uses_provider_credentials_and_anonymous_unsigned_config(monkeypatch):
+    calls = []
+
+    class FakeSessionFactory:
+        def __init__(self, **kwargs):
+            calls.append({"session": kwargs})
+
+        def client(self, service_name, **kwargs):
+            calls.append({"service_name": service_name, "client": kwargs})
+            return "client"
+
+    monkeypatch.setattr("ccflow_s3.base.Session", FakeSessionFactory)
+
+    cloudflare_client = S3Client(
+        provider=S3Provider(name="cloudflare", account_id="account-id"),
+        credentials=S3ClientCredentials(mode="access_key", access_key_id="key", secret_access_key="secret"),
+    )
+    anonymous_client = S3Client(
+        provider=S3Provider(name="custom", endpoint_url="https://objects.example.test", region_name="us-east-1"),
+        credentials=S3ClientCredentials(mode="anonymous"),
+    )
+
+    assert cloudflare_client.client == "client"
+    assert anonymous_client.client == "client"
+    assert calls[0]["session"] == {"aws_access_key_id": "key", "aws_secret_access_key": "secret", "region_name": "auto"}
+    assert calls[1]["client"]["endpoint_url"] == "https://account-id.r2.cloudflarestorage.com"
+    assert calls[1]["client"]["region_name"] == "auto"
+    assert calls[2]["session"] == {}
+    assert calls[3]["client"]["endpoint_url"] == "https://objects.example.test"
+    assert calls[3]["client"]["config"].signature_version is UNSIGNED
+
+
+def test_s3_client_and_credentials_hydra_groups_compose_with_cache_and_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_R2_ACCOUNT_ID", "account-id")
+    monkeypatch.setenv("CLOUDFLARE_R2_ACCESS_KEY_ID", "access-key")
+    monkeypatch.setenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", "secret-key")
+
+    (tmp_path / "runner.yaml").write_text(
+        """
+defaults:
+    - _self_
+    - client: /clients/s3/cloudflare
+    - credentials: /credentials/s3/cloudflare
+    - cache: s3
+    - output: /outputs/s3
+
+hydra:
+    searchpath:
+        - pkg://ccflow_s3.config
+""".lstrip()
+    )
+
+    with initialize_config_dir(config_dir=str(tmp_path), version_base=None):
+        cfg = compose(config_name="runner")
+
+    cache_store = instantiate(cfg.cache.store)
+    output = instantiate(cfg.output)
+
+    assert isinstance(cache_store.client.provider, S3Provider)
+    assert isinstance(output.client.credentials, S3ClientCredentials)
+    assert isinstance(instantiate(cfg.credentials.s3.cloudflare), S3ClientCredentials)
+    assert output.client.resolved_endpoint_url() == "https://account-id.r2.cloudflarestorage.com"
+    assert output.client.credentials.session_kwargs()["aws_access_key_id"] == "access-key"
+    assert cache_store.client.resolved_region_name() == "auto"
+
+
 def test_s3_session_accepts_generic_key_secret_credentials(monkeypatch):
     monkeypatch.setenv("S3_TEST_KEY", "configured-key")
     monkeypatch.setenv("S3_TEST_SECRET", "configured-secret")
@@ -372,7 +504,7 @@ def test_s3_session_accepts_generic_key_secret_credentials(monkeypatch):
     )._session_kwargs() == {"aws_access_key_id": "explicit-key", "aws_secret_access_key": "explicit-secret"}
 
 
-def test_s3_cache_and_checkpoint_adapters_use_s3_objects(monkeypatch):
+def test_s3_cache_adapter_uses_s3_objects(monkeypatch):
     backend = FakeS3Backend()
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
     client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
@@ -380,14 +512,8 @@ def test_s3_cache_and_checkpoint_adapters_use_s3_objects(monkeypatch):
     cache = S3CacheStore(client=client, bucket="bucket", prefix="cache")
     cache.put_bytes("daily/AAA", b'{"ticker":"AAA"}', content_type="application/json")
 
-    checkpoint = S3CheckpointStore(client=client, bucket="bucket", prefix="checkpoints")
-    record = checkpoint.mark_succeeded("daily/AAA", metadata={"rows": 1})
-
     assert cache.exists("daily/AAA") is True
     assert cache.get_bytes("daily/AAA") == b'{"ticker":"AAA"}'
-    assert isinstance(record, CheckpointRecord)
-    assert checkpoint.should_skip("daily/AAA") is True
-    assert checkpoint.get("daily/AAA").metadata == {"rows": 1}
 
 
 def test_s3_cache_store_works_with_generic_cache_models(monkeypatch):
@@ -407,6 +533,74 @@ def test_s3_cache_store_works_with_generic_cache_models(monkeypatch):
     assert backend.objects[("bucket", "cache/daily/AAA.json")]["ContentType"] == "application/json"
     assert get_result.status == "hit"
     assert get_result.payload == {"ticker": "AAA"}
+
+
+def test_s3_artifact_store_implements_generic_artifact_contract(monkeypatch):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "outputs/existing.json")] = {"Body": b"{}", "ContentType": "application/json", "ETag": "etag"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    write_model = ArtifactWriteModel(store=store)
+    planned = write_model(
+        {
+            "key": "planned.json",
+            "payload": b"{}",
+            "media_type": "application/json",
+            "dataset": "sample_records",
+            "dry_run": True,
+        }
+    )
+    written = write_model(
+        {
+            "key": "new.json",
+            "payload": b"{}",
+            "media_type": "application/json",
+            "dataset": "sample_records",
+            "metadata": {"run": "test"},
+        }
+    )
+    existing = write_model({"key": "existing.json", "payload": b"{}", "media_type": "application/json", "dataset": "sample_records"})
+
+    assert store.artifact_uri("new.json") == "s3://bucket/outputs/new.json"
+    assert planned.status == "planned"
+    assert written.status == "written"
+    assert written.artifact.uri == "s3://bucket/outputs/new.json"
+    assert existing.status == "exists"
+    assert backend.objects[("bucket", "outputs/new.json")]["Body"] == b"{}"
+    assert backend.objects[("bucket", "outputs/new.json")]["Metadata"] == {"run": "test"}
+
+
+def test_s3_artifact_store_publishes_from_temp_key(monkeypatch):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "outputs/tmp/final.json")] = {"Body": b"{}", "ContentType": "application/json", "ETag": "tmp-etag"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    result = store.publish("final.json", source_key="tmp/final.json")
+
+    assert result["status"] == "published"
+    assert result["object"] == "outputs/final.json"
+    assert backend.objects[("bucket", "outputs/final.json")]["Body"] == b"{}"
+
+
+def test_s3_artifact_store_writes_local_file(monkeypatch, tmp_path):
+    backend = FakeS3Backend()
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+    source_path = tmp_path / "daily.parquet"
+    source_path.write_bytes(b"parquet-bytes")
+
+    result = store.write_file("daily.parquet", source_path, media_type="application/vnd.apache.parquet", metadata={"dataset": "sample"})
+
+    assert result["status"] == "written"
+    assert result["size"] == len(b"parquet-bytes")
+    assert backend.objects[("bucket", "outputs/daily.parquet")]["Body"] == b"parquet-bytes"
+    assert backend.objects[("bucket", "outputs/daily.parquet")]["ContentType"] == "application/vnd.apache.parquet"
+    assert backend.objects[("bucket", "outputs/daily.parquet")]["Metadata"] == {"dataset": "sample"}
 
 
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):

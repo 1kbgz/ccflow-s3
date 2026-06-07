@@ -1,9 +1,12 @@
+import os
 from datetime import datetime, timezone
 from json import dumps
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
-from urllib.parse import quote
+from urllib.parse import urlparse
 
 from boto3 import Session
+from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from ccflow import (
@@ -13,17 +16,15 @@ from ccflow import (
     GenericResult,
     NullContext,
 )
-from ccflow_etl import APIKeySecretCredentials, CacheFormat, CheckpointRecord, CheckpointStatus, PayloadCodec
-
-try:
-    from orjson import loads
-except ImportError:
-    from json import loads
+from ccflow_etl import APIKeySecretCredentials, CacheFormat, PayloadCodec
 from pydantic import Field
 
 __all__ = (
     "S3Config",
     "S3Credentials",
+    "S3ClientCredentials",
+    "S3Auth",
+    "S3Provider",
     "S3Session",
     "S3Client",
     "S3Context",
@@ -37,7 +38,7 @@ __all__ = (
     "S3ReadWriteContext",
     "S3WriteDataContext",
     "S3CacheStore",
-    "S3CheckpointStore",
+    "S3ArtifactStore",
     "S3ObjectManifest",
     "S3Result",
     "S3ExistsResult",
@@ -52,17 +53,142 @@ __all__ = (
 )
 
 
+def _env_value(name: Optional[str]) -> Optional[str]:
+    return os.environ.get(name) if name else None
+
+
+def _first_configured(*values: Optional[str]) -> Optional[str]:
+    return next((value for value in values if value not in (None, "")), None)
+
+
 class S3Config(BaseModel):
-    signature_version: str = "s3v4"
+    signature_version: Optional[str] = "s3v4"
+    addressing_style: Optional[Literal["auto", "virtual", "path"]] = None
+    connect_timeout: Optional[float] = None
+    read_timeout: Optional[float] = None
+    retries: Dict[str, Any] = Field(default_factory=dict)
+    user_agent_extra: Optional[str] = None
+
+    def create_config(self, *, unsigned: bool = False) -> Config:
+        kwargs: Dict[str, Any] = {}
+        if unsigned:
+            kwargs["signature_version"] = UNSIGNED
+        elif self.signature_version:
+            kwargs["signature_version"] = self.signature_version
+        if self.addressing_style:
+            kwargs["s3"] = {"addressing_style": self.addressing_style}
+        if self.connect_timeout is not None:
+            kwargs["connect_timeout"] = self.connect_timeout
+        if self.read_timeout is not None:
+            kwargs["read_timeout"] = self.read_timeout
+        if self.retries:
+            kwargs["retries"] = self.retries
+        if self.user_agent_extra:
+            kwargs["user_agent_extra"] = self.user_agent_extra
+        return Config(**kwargs)
 
     @property
     def config(self) -> Config:
-        return Config(signature_version=self.signature_version)
+        return self.create_config()
 
 
 class S3Credentials(APIKeySecretCredentials):
     api_key_env: Optional[str] = "AWS_ACCESS_KEY_ID"
     secret_key_env: Optional[str] = "AWS_SECRET_ACCESS_KEY"
+
+
+class S3ClientCredentials(BaseModel):
+    mode: Literal["default", "profile", "access_key", "env", "credentials", "anonymous"] = "default"
+    credentials: Optional[APIKeySecretCredentials] = None
+    access_key_id: Optional[str] = Field(default=None, repr=False)
+    secret_access_key: Optional[str] = Field(default=None, repr=False)
+    session_token: Optional[str] = Field(default=None, repr=False)
+    access_key_id_env: Optional[str] = None
+    secret_access_key_env: Optional[str] = None
+    session_token_env: Optional[str] = None
+    profile_name: Optional[str] = None
+    region_name: Optional[str] = None
+    region_name_env: Optional[str] = None
+
+    @property
+    def is_anonymous(self) -> bool:
+        return self.mode == "anonymous"
+
+    def resolved_region_name(self) -> Optional[str]:
+        return _first_configured(self.region_name, _env_value(self.region_name_env))
+
+    def _resolved_access_key_id(self) -> Optional[str]:
+        if self.credentials:
+            return _first_configured(self.access_key_id, self.credentials.resolved_api_key(), _env_value(self.access_key_id_env))
+        return _first_configured(self.access_key_id, _env_value(self.access_key_id_env))
+
+    def _resolved_secret_access_key(self) -> Optional[str]:
+        if self.credentials:
+            return _first_configured(self.secret_access_key, self.credentials.resolved_secret_key(), _env_value(self.secret_access_key_env))
+        return _first_configured(self.secret_access_key, _env_value(self.secret_access_key_env))
+
+    def _resolved_session_token(self) -> Optional[str]:
+        return _first_configured(self.session_token, _env_value(self.session_token_env))
+
+    def session_kwargs(self, region_name: Optional[str] = None) -> Dict[str, str]:
+        if self.mode == "anonymous":
+            return {}
+        if self.mode == "default":
+            return {key: value for key, value in {"region_name": region_name or self.resolved_region_name()}.items() if value is not None}
+        if self.mode == "profile":
+            kwargs = {"profile_name": self.profile_name, "region_name": region_name or self.resolved_region_name()}
+            return {key: value for key, value in kwargs.items() if value is not None}
+
+        kwargs = {
+            "aws_access_key_id": self._resolved_access_key_id(),
+            "aws_secret_access_key": self._resolved_secret_access_key(),
+            "aws_session_token": self._resolved_session_token(),
+            "region_name": region_name or self.resolved_region_name(),
+        }
+        return {key: value for key, value in kwargs.items() if value is not None}
+
+    def create_session(self, region_name: Optional[str] = None) -> Session:
+        return Session(**self.session_kwargs(region_name=region_name))
+
+
+S3Auth = S3ClientCredentials
+
+
+class S3Provider(BaseModel):
+    name: Literal["aws", "backblaze", "hetzner", "cloudflare", "custom"] = "aws"
+    endpoint_url: Optional[str] = None
+    endpoint_url_env: Optional[str] = None
+    region_name: Optional[str] = None
+    region_name_env: Optional[str] = None
+    account_id: Optional[str] = None
+    account_id_env: Optional[str] = None
+
+    def resolved_region_name(self) -> Optional[str]:
+        region = _first_configured(self.region_name, _env_value(self.region_name_env))
+        if self.name == "aws":
+            return region or _env_value("AWS_DEFAULT_REGION")
+        if self.name == "cloudflare":
+            return region or "auto"
+        return region
+
+    def resolved_endpoint_url(self) -> Optional[str]:
+        endpoint_url = _first_configured(self.endpoint_url, _env_value(self.endpoint_url_env))
+        if endpoint_url:
+            return endpoint_url
+        region = self.resolved_region_name()
+        if self.name == "aws":
+            return None
+        if self.name == "backblaze" and region:
+            return f"https://s3.{region}.backblazeb2.com"
+        if self.name == "hetzner" and region:
+            return f"https://{region}.your-objectstorage.com"
+        if self.name == "cloudflare":
+            account_id = _first_configured(self.account_id, _env_value(self.account_id_env))
+            if account_id:
+                return f"https://{account_id}.r2.cloudflarestorage.com"
+        if self.name == "custom":
+            raise ValueError("S3Provider custom requires endpoint_url or endpoint_url_env.")
+        raise ValueError(f"S3Provider {self.name} requires endpoint_url, endpoint_url_env, or provider-specific endpoint fields.")
 
 
 class S3Session(BaseModel):
@@ -94,17 +220,48 @@ class S3Session(BaseModel):
 
 class S3Client(BaseModel):
     endpoint_url: Optional[str] = None
+    provider: Optional[S3Provider] = None
+    credentials: Optional[S3ClientCredentials] = None
+    auth: Optional[S3ClientCredentials] = None
     session: S3Session = Field(default_factory=S3Session)
     config: S3Config = Field(default_factory=S3Config)
     region_name: Optional[str] = None
 
+    def _credentials(self) -> Optional[S3ClientCredentials]:
+        return self.credentials or self.auth
+
+    def resolved_region_name(self) -> Optional[str]:
+        provider_region = self.provider.resolved_region_name() if self.provider else None
+        credentials = self._credentials()
+        auth_region = credentials.resolved_region_name() if credentials else None
+        return _first_configured(self.region_name, provider_region, auth_region, self.session.region_name)
+
+    def resolved_endpoint_url(self) -> Optional[str]:
+        endpoint_url = _first_configured(self.endpoint_url)
+        if endpoint_url:
+            return endpoint_url
+        if self.provider:
+            return self.provider.resolved_endpoint_url()
+        return None
+
+    def create_session(self, region_name: Optional[str] = None) -> Session:
+        credentials = self._credentials()
+        if credentials:
+            return credentials.create_session(region_name=region_name)
+        return self.session.create_session(region_name=region_name)
+
+    def create_config(self) -> Config:
+        credentials = self._credentials()
+        return self.config.create_config(unsigned=bool(credentials and credentials.is_anonymous))
+
     @property
     def client(self):
-        return self.session.create_session(region_name=self.region_name).client(
+        region_name = self.resolved_region_name()
+        return self.create_session(region_name=region_name).client(
             "s3",
-            endpoint_url=self.endpoint_url,
-            region_name=self.region_name,
-            config=self.config.config,
+            endpoint_url=self.resolved_endpoint_url(),
+            region_name=region_name,
+            config=self.create_config(),
         )
 
 
@@ -235,47 +392,80 @@ class S3CacheStore(BaseModel):
         return {"bucket": self.bucket, "object": self._object_key(key), "etag": response.get("ETag")}
 
 
-class S3CheckpointStore(BaseModel):
+class S3ArtifactStore(BaseModel):
     client: S3Client
     bucket: str
-    prefix: str = "checkpoints"
+    prefix: str = ""
 
-    def _object_key(self, key: str) -> str:
+    def object_key(self, key: str) -> str:
         clean_prefix = self.prefix.strip("/")
-        encoded_key = quote(key, safe="")
-        return f"{clean_prefix}/{encoded_key}.json" if clean_prefix else f"{encoded_key}.json"
+        clean_key = key.lstrip("/")
+        return f"{clean_prefix}/{clean_key}" if clean_prefix else clean_key
 
-    def get(self, key: str) -> Optional[CheckpointRecord]:
+    def artifact_uri(self, key: str) -> str:
+        return f"s3://{self.bucket}/{self.object_key(key)}"
+
+    def exists(self, key: str) -> bool:
         try:
-            body = self.client.client.get_object(Bucket=self.bucket, Key=self._object_key(key))["Body"].read()
+            self.client.client.head_object(Bucket=self.bucket, Key=self.object_key(key))
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in {"404", "NoSuchKey", "NotFound"}:
-                return None
+                return False
             raise
-        return CheckpointRecord(**loads(body))
+        return True
 
-    def mark(self, key: str, status: CheckpointStatus, metadata: Optional[Dict[str, Any]] = None) -> CheckpointRecord:
-        record = CheckpointRecord(
-            key=key,
-            status=status,
-            updated_at=datetime.now(timezone.utc).isoformat(),
-            metadata=metadata or {},
-        )
-        self.client.client.put_object(
-            Bucket=self.bucket,
-            Key=self._object_key(key),
-            Body=dumps(record.model_dump(), separators=(",", ":"), sort_keys=True).encode("utf-8"),
-            ContentType="application/json",
-        )
-        return record
+    def write(self, key: str, payload: bytes, media_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        kwargs = {"Bucket": self.bucket, "Key": self.object_key(key), "Body": payload}
+        if media_type:
+            kwargs["ContentType"] = media_type
+        if metadata:
+            kwargs["Metadata"] = {str(metadata_key): str(metadata_value) for metadata_key, metadata_value in metadata.items()}
+        response = self.client.client.put_object(**kwargs)
+        return {"bucket": self.bucket, "object": self.object_key(key), "etag": response.get("ETag"), "status": "written"}
 
-    def mark_succeeded(self, key: str, metadata: Optional[Dict[str, Any]] = None) -> CheckpointRecord:
-        return self.mark(key=key, status="succeeded", metadata=metadata)
+    def write_file(self, key: str, path: str | Path, media_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        source_path = Path(path)
+        kwargs = {"Bucket": self.bucket, "Key": self.object_key(key)}
+        if media_type:
+            kwargs["ContentType"] = media_type
+        if metadata:
+            kwargs["Metadata"] = {str(metadata_key): str(metadata_value) for metadata_key, metadata_value in metadata.items()}
+        with source_path.open("rb") as file_obj:
+            response = self.client.client.put_object(Body=file_obj, **kwargs)
+        return {
+            "bucket": self.bucket,
+            "object": self.object_key(key),
+            "etag": response.get("ETag"),
+            "path": str(source_path),
+            "size": source_path.stat().st_size,
+            "status": "written",
+        }
 
-    def should_skip(self, key: str) -> bool:
-        record = self.get(key)
-        return record is not None and record.status == "succeeded"
+    def _source(self, source_key: Optional[str], source_uri: Optional[str]) -> Dict[str, str]:
+        if source_key:
+            return {"Bucket": self.bucket, "Key": self.object_key(source_key)}
+        if source_uri:
+            parsed = urlparse(source_uri)
+            if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
+                raise ValueError("S3ArtifactStore source_uri must be an s3://bucket/key URI.")
+            return {"Bucket": parsed.netloc, "Key": parsed.path.lstrip("/")}
+        raise ValueError("S3ArtifactStore.publish requires source_key or source_uri.")
+
+    def publish(
+        self, key: str, source_key: Optional[str] = None, source_uri: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        response = self.client.client.copy_object(Bucket=self.bucket, Key=self.object_key(key), CopySource=self._source(source_key, source_uri))
+        copy_result = response.get("CopyObjectResult", {})
+        return {
+            "bucket": self.bucket,
+            "object": self.object_key(key),
+            "source_key": source_key,
+            "source_uri": source_uri,
+            "etag": copy_result.get("ETag"),
+            "status": "published",
+            **(metadata or {}),
+        }
 
 
 class S3Model(CallableModel):

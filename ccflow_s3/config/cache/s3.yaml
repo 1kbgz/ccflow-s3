@@ -4,6 +4,10 @@ store:
   _target_: ccflow_s3.S3CacheStore
   client:
     _target_: ccflow_s3.S3Client
+    endpoint_url: ${oc.select:client.endpoint_url,null}
+    provider: ${oc.select:client.provider,null}
+    credentials: ${oc.select:client.credentials,null}
+    region_name: ${oc.select:client.region_name,null}
   bucket: ""
   prefix: cache
 

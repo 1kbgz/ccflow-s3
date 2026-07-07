@@ -61,6 +61,16 @@ def _first_configured(*values: Optional[str]) -> Optional[str]:
     return next((value for value in values if value not in (None, "")), None)
 
 
+def _read_object_body(response: Dict[str, Any]) -> bytes:
+    body = response["Body"]
+    try:
+        return body.read()
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+
+
 class S3Config(BaseModel):
     signature_version: Optional[str] = "s3v4"
     addressing_style: Optional[Literal["auto", "virtual", "path"]] = None
@@ -382,7 +392,7 @@ class S3CacheStore(BaseModel):
         return True
 
     def get_bytes(self, key: str) -> bytes:
-        return self.client.client.get_object(Bucket=self.bucket, Key=self._object_key(key))["Body"].read()
+        return _read_object_body(self.client.client.get_object(Bucket=self.bucket, Key=self._object_key(key)))
 
     def put_bytes(self, key: str, value: bytes, content_type: Optional[str] = None) -> Dict[str, Any]:
         kwargs = {"Bucket": self.bucket, "Key": self._object_key(key), "Body": value}
@@ -416,7 +426,7 @@ class S3ArtifactStore(BaseModel):
         return True
 
     def read(self, key: str) -> bytes:
-        return self.client.client.get_object(Bucket=self.bucket, Key=self.object_key(key))["Body"].read()
+        return _read_object_body(self.client.client.get_object(Bucket=self.bucket, Key=self.object_key(key)))
 
     def get_bytes(self, key: str) -> bytes:
         return self.read(key)

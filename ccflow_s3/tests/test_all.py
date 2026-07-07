@@ -43,9 +43,14 @@ class FakeS3Backend:
     def __init__(self):
         self.objects = {}
         self.list_calls = []
+        self.bodies = []
 
     def get_object(self, Bucket, Key):
-        return {"Body": FakeBody(self.objects[(Bucket, Key)]["Body"])}
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        body = FakeBody(self.objects[(Bucket, Key)]["Body"])
+        self.bodies.append(body)
+        return {"Body": body}
 
     def head_object(self, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -96,9 +101,13 @@ class FakeS3Backend:
 class FakeBody:
     def __init__(self, body):
         self.body = body
+        self.closed = False
 
     def read(self):
         return self.body
+
+    def close(self):
+        self.closed = True
 
 
 def test_release_surface_has_no_unimplemented_skeleton_models():
@@ -569,7 +578,11 @@ def test_s3_artifact_store_implements_generic_artifact_contract(monkeypatch):
     assert written.artifact.uri == "s3://bucket/outputs/new.json"
     assert existing.status == "exists"
     assert store.read("existing.json") == b"{}"
+    assert backend.bodies[-1].closed is True
     assert store.get_bytes("existing.json") == b"{}"
+    assert backend.bodies[-1].closed is True
+    with pytest.raises(ClientError):
+        store.read("missing.json")
     assert backend.objects[("bucket", "outputs/new.json")]["Body"] == b"{}"
     assert backend.objects[("bucket", "outputs/new.json")]["Metadata"] == {"run": "test"}
 

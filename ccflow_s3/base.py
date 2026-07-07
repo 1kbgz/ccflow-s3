@@ -415,6 +415,12 @@ class S3ArtifactStore(BaseModel):
             raise
         return True
 
+    def read(self, key: str) -> bytes:
+        return self.client.client.get_object(Bucket=self.bucket, Key=self.object_key(key))["Body"].read()
+
+    def get_bytes(self, key: str) -> bytes:
+        return self.read(key)
+
     def write(self, key: str, payload: bytes, media_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         kwargs = {"Bucket": self.bucket, "Key": self.object_key(key), "Body": payload}
         if media_type:

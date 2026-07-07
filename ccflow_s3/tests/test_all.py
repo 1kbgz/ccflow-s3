@@ -568,6 +568,8 @@ def test_s3_artifact_store_implements_generic_artifact_contract(monkeypatch):
     assert written.status == "written"
     assert written.artifact.uri == "s3://bucket/outputs/new.json"
     assert existing.status == "exists"
+    assert store.read("existing.json") == b"{}"
+    assert store.get_bytes("existing.json") == b"{}"
     assert backend.objects[("bucket", "outputs/new.json")]["Body"] == b"{}"
     assert backend.objects[("bucket", "outputs/new.json")]["Metadata"] == {"run": "test"}
 

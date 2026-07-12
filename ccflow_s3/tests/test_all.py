@@ -1,9 +1,9 @@
 import json
+import tomllib
 from gzip import decompress
 from pathlib import Path
 
 import pytest
-import tomllib
 from botocore import UNSIGNED
 from botocore.exceptions import ClientError
 from ccflow_etl import (

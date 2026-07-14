@@ -585,6 +585,8 @@ def test_s3_artifact_store_implements_generic_artifact_contract(monkeypatch):
         store.read("missing.json")
     assert backend.objects[("bucket", "outputs/new.json")]["Body"] == b"{}"
     assert backend.objects[("bucket", "outputs/new.json")]["Metadata"] == {"run": "test"}
+    assert store.list_keys() == ["existing.json", "new.json"]
+    assert store.list_keys("existing") == ["existing.json"]
 
 
 def test_s3_artifact_store_publishes_from_temp_key(monkeypatch):
@@ -599,6 +601,22 @@ def test_s3_artifact_store_publishes_from_temp_key(monkeypatch):
     assert result["status"] == "published"
     assert result["object"] == "outputs/final.json"
     assert backend.objects[("bucket", "outputs/final.json")]["Body"] == b"{}"
+
+
+def test_s3_artifact_store_lists_every_inventory_page(monkeypatch):
+    class PagedBackend(FakeS3Backend):
+        def list_objects_v2(self, Bucket, Prefix="", ContinuationToken=None, MaxKeys=None):
+            return super().list_objects_v2(Bucket, Prefix, ContinuationToken, MaxKeys=1)
+
+    backend = PagedBackend()
+    backend.objects[("bucket", "outputs/daily/AAA.json")] = {"Body": b"{}"}
+    backend.objects[("bucket", "outputs/daily/BBB.json")] = {"Body": b"{}"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    assert store.list_keys("daily") == ["daily/AAA.json", "daily/BBB.json"]
+    assert len(backend.list_calls) == 2
 
 
 def test_s3_artifact_store_writes_local_file(monkeypatch, tmp_path):

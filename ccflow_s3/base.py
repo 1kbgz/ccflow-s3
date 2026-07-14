@@ -425,6 +425,30 @@ class S3ArtifactStore(BaseModel):
             raise
         return True
 
+    def list_keys(self, prefix: str = "") -> List[str]:
+        object_prefix = self.object_key(prefix)
+        configured_prefix = self.prefix.strip("/")
+        if not prefix and configured_prefix:
+            object_prefix = f"{configured_prefix}/"
+        keys = []
+        continuation_token = None
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": object_prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = self.client.client.list_objects_v2(**kwargs)
+            for item in response.get("Contents", []):
+                object_key = str(item["Key"])
+                if configured_prefix:
+                    object_key = object_key.removeprefix(f"{configured_prefix}/")
+                keys.append(object_key)
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+        return sorted(keys)
+
     def read(self, key: str) -> bytes:
         return _read_object_body(self.client.client.get_object(Bucket=self.bucket, Key=self.object_key(key)))
 

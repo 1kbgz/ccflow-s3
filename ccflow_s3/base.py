@@ -467,6 +467,18 @@ class S3ArtifactStore(BaseModel):
     def read(self, key: str) -> bytes:
         return _get_object_bytes(self.client.client, Bucket=self.bucket, Key=self.object_key(key))
 
+    def read_file(self, key: str, path: str | Path) -> dict[str, Any]:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.client.client.download_file(Bucket=self.bucket, Key=self.object_key(key), Filename=str(output_path))
+        return {
+            "bucket": self.bucket,
+            "object": self.object_key(key),
+            "path": str(output_path),
+            "size": output_path.stat().st_size,
+            "status": "materialized",
+        }
+
     def get_bytes(self, key: str) -> bytes:
         return self.read(key)
 

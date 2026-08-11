@@ -93,6 +93,11 @@ class FakeS3Backend:
         self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType, "Metadata": Metadata or {}, "ETag": "etag"}
         return {"ETag": "etag"}
 
+    def download_file(self, Bucket, Key, Filename):
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        Path(Filename).write_bytes(self.objects[(Bucket, Key)]["Body"])
+
     def delete_object(self, Bucket, Key):
         self.objects.pop((Bucket, Key), None)
         return {"DeleteMarker": True}
@@ -634,6 +639,22 @@ def test_s3_artifact_store_writes_local_file(monkeypatch, tmp_path):
     assert backend.objects[("bucket", "outputs/daily.parquet")]["Body"] == b"parquet-bytes"
     assert backend.objects[("bucket", "outputs/daily.parquet")]["ContentType"] == "application/vnd.apache.parquet"
     assert backend.objects[("bucket", "outputs/daily.parquet")]["Metadata"] == {"dataset": "sample"}
+
+
+def test_s3_artifact_store_materializes_file_without_reading_bytes(monkeypatch, tmp_path):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "outputs/daily.csv.gz")] = {"Body": b"compressed-bars"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+    output_path = tmp_path / "raw" / "daily.csv.gz"
+
+    result = store.read_file("daily.csv.gz", output_path)
+
+    assert result["status"] == "materialized"
+    assert result["size"] == len(b"compressed-bars")
+    assert output_path.read_bytes() == b"compressed-bars"
+    assert backend.bodies == []
 
 
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):

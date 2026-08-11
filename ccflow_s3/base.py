@@ -2,13 +2,14 @@ import os
 from datetime import UTC, datetime
 from json import dumps
 from pathlib import Path
+from time import sleep
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from boto3 import Session
 from botocore import UNSIGNED
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ConnectionClosedError, ReadTimeoutError, ResponseStreamingError
 from ccflow import (
     BaseModel,
     CallableModel,
@@ -59,6 +60,20 @@ def _env_value(name: str | None) -> str | None:
 
 def _first_configured(*values: str | None) -> str | None:
     return next((value for value in values if value not in (None, "")), None)
+
+
+_STREAM_RETRY_EXCEPTIONS = (ResponseStreamingError, ConnectionClosedError, ReadTimeoutError)
+
+
+def _get_object_bytes(client: Any, *, max_attempts: int = 5, wait_initial: float = 1.0, **kwargs: Any) -> bytes:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _read_object_body(client.get_object(**kwargs))
+        except _STREAM_RETRY_EXCEPTIONS:
+            if attempt >= max_attempts:
+                raise
+            sleep(wait_initial * 2 ** (attempt - 1))
+    raise RuntimeError("unreachable")
 
 
 def _read_object_body(response: dict[str, Any]) -> bytes:
@@ -392,7 +407,7 @@ class S3CacheStore(BaseModel):
         return True
 
     def get_bytes(self, key: str) -> bytes:
-        return _read_object_body(self.client.client.get_object(Bucket=self.bucket, Key=self._object_key(key)))
+        return _get_object_bytes(self.client.client, Bucket=self.bucket, Key=self._object_key(key))
 
     def put_bytes(self, key: str, value: bytes, content_type: str | None = None) -> dict[str, Any]:
         kwargs = {"Bucket": self.bucket, "Key": self._object_key(key), "Body": value}
@@ -450,7 +465,7 @@ class S3ArtifactStore(BaseModel):
         return sorted(keys)
 
     def read(self, key: str) -> bytes:
-        return _read_object_body(self.client.client.get_object(Bucket=self.bucket, Key=self.object_key(key)))
+        return _get_object_bytes(self.client.client, Bucket=self.bucket, Key=self.object_key(key))
 
     def get_bytes(self, key: str) -> bytes:
         return self.read(key)
@@ -521,9 +536,7 @@ class S3Model(CallableModel):
         return PayloadCodec(format=self.format)
 
     def _read_data(self, client: S3Client, bucket: str, object: str) -> S3ReadResult:
-        read_response = client.client.get_object(Bucket=bucket, Key=object)
-
-        return S3ReadResult(value=self.codec.decode(read_response["Body"].read()))
+        return S3ReadResult(value=self.codec.decode(_get_object_bytes(client.client, Bucket=bucket, Key=object)))
 
     def _object_exists(self, client: S3Client, bucket: str, object: str) -> bool:
         try:

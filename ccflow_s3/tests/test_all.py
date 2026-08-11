@@ -662,3 +662,55 @@ def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):
     assert ("bucket", "tmp/daily/AAA.json") in backend.objects
     assert ("bucket", "daily/AAA.json") not in backend.objects
     assert ("bucket", "manifests/daily/AAA.json") not in backend.objects
+
+
+def test_get_object_bytes_retries_broken_stream(monkeypatch):
+    from botocore.exceptions import ResponseStreamingError
+
+    monkeypatch.setattr(s3_base, "sleep", lambda _: None)
+    calls = []
+
+    class FlakyBody:
+        def read(self):
+            raise ResponseStreamingError(error=OSError("Connection broken: IncompleteRead"))
+
+        def close(self):
+            return None
+
+    class GoodBody:
+        def read(self):
+            return b"payload"
+
+        def close(self):
+            return None
+
+    class FakeBoto:
+        def get_object(self, **kwargs):
+            calls.append(kwargs)
+            return {"Body": FlakyBody() if len(calls) < 3 else GoodBody()}
+
+    assert s3_base._get_object_bytes(FakeBoto(), Bucket="b", Key="k") == b"payload"
+    assert len(calls) == 3
+
+
+def test_get_object_bytes_raises_after_exhausting_retries(monkeypatch):
+    from botocore.exceptions import ResponseStreamingError
+
+    monkeypatch.setattr(s3_base, "sleep", lambda _: None)
+    calls = []
+
+    class FlakyBody:
+        def read(self):
+            raise ResponseStreamingError(error=OSError("Connection broken"))
+
+        def close(self):
+            return None
+
+    class FakeBoto:
+        def get_object(self, **kwargs):
+            calls.append(kwargs)
+            return {"Body": FlakyBody()}
+
+    with pytest.raises(ResponseStreamingError):
+        s3_base._get_object_bytes(FakeBoto(), Bucket="b", Key="k")
+    assert len(calls) == 5

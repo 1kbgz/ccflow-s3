@@ -656,6 +656,9 @@ def test_s3_artifact_store_materializes_file_without_reading_bytes(monkeypatch, 
     assert output_path.read_bytes() == b"compressed-bars"
     assert backend.bodies == []
 
+    with pytest.raises(ClientError):
+        store.read_file("missing.csv.gz", tmp_path / "missing.csv.gz")
+
 
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):
     class FailingCopyBackend(FakeS3Backend):

@@ -698,6 +698,22 @@ def test_s3_artifact_store_reports_object_identity_and_pins_materialized_version
     assert backend.download_args == [{"VersionId": "v-7"}, None]
 
 
+def test_s3_artifact_store_rejects_unversioned_object_replaced_during_download(monkeypatch, tmp_path):
+    class ReplacingBackend(FakeS3Backend):
+        def download_file(self, Bucket, Key, Filename, ExtraArgs=None):
+            super().download_file(Bucket, Key, Filename, ExtraArgs)
+            self.objects[(Bucket, Key)] = {"Body": b"replaced", "ETag": '"new"'}
+
+    backend = ReplacingBackend()
+    backend.objects[("bucket", "outputs/daily.csv.gz")] = {"Body": b"original", "ETag": '"old"'}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    with pytest.raises(RuntimeError, match="changed during download"):
+        store.read_file("daily.csv.gz", tmp_path / "daily.csv.gz")
+
+
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):
     class FailingCopyBackend(FakeS3Backend):
         def copy_object(self, Bucket, Key, CopySource, ContentType=None):

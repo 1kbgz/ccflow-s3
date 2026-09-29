@@ -467,13 +467,28 @@ class S3ArtifactStore(BaseModel):
     def read(self, key: str) -> bytes:
         return _get_object_bytes(self.client.client, Bucket=self.bucket, Key=self.object_key(key))
 
-    def read_file(self, key: str, path: str | Path) -> dict[str, Any]:
-        output_path = Path(path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.client.client.download_file(Bucket=self.bucket, Key=self.object_key(key), Filename=str(output_path))
+    def head(self, key: str) -> dict[str, Any]:
+        response = self.client.client.head_object(Bucket=self.bucket, Key=self.object_key(key))
+        last_modified = response.get("LastModified")
         return {
             "bucket": self.bucket,
             "object": self.object_key(key),
+            "etag": response.get("ETag"),
+            "version_id": response.get("VersionId"),
+            "size": response.get("ContentLength"),
+            "last_modified": last_modified.isoformat() if last_modified is not None else None,
+            "content_type": response.get("ContentType"),
+        }
+
+    def read_file(self, key: str, path: str | Path) -> dict[str, Any]:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        identity = self.head(key)
+        # Pin the download to the version that head() identified so the returned identity describes the bytes on disk.
+        extra_args = {"VersionId": identity["version_id"]} if identity["version_id"] else None
+        self.client.client.download_file(Bucket=self.bucket, Key=self.object_key(key), Filename=str(output_path), ExtraArgs=extra_args)
+        return {
+            **identity,
             "path": str(output_path),
             "size": output_path.stat().st_size,
             "status": "materialized",

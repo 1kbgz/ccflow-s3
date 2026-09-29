@@ -1,5 +1,6 @@
 import json
 import tomllib
+from datetime import UTC, datetime
 from gzip import decompress
 from pathlib import Path
 
@@ -44,6 +45,7 @@ class FakeS3Backend:
         self.objects = {}
         self.list_calls = []
         self.bodies = []
+        self.download_args = []
 
     def get_object(self, Bucket, Key):
         if (Bucket, Key) not in self.objects:
@@ -58,12 +60,16 @@ class FakeS3Backend:
 
             raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
         stored = self.objects[(Bucket, Key)]
-        return {
+        response = {
             "ETag": stored.get("ETag", "etag"),
             "ContentLength": len(stored["Body"]),
             "ContentType": stored.get("ContentType"),
             "Metadata": stored.get("Metadata", {}),
         }
+        for field in ("VersionId", "LastModified"):
+            if field in stored:
+                response[field] = stored[field]
+        return response
 
     def list_objects_v2(self, Bucket, Prefix="", ContinuationToken=None, MaxKeys=None):
         self.list_calls.append({"Bucket": Bucket, "Prefix": Prefix, "ContinuationToken": ContinuationToken, "MaxKeys": MaxKeys})
@@ -93,9 +99,10 @@ class FakeS3Backend:
         self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType, "Metadata": Metadata or {}, "ETag": "etag"}
         return {"ETag": "etag"}
 
-    def download_file(self, Bucket, Key, Filename):
+    def download_file(self, Bucket, Key, Filename, ExtraArgs=None):
         if (Bucket, Key) not in self.objects:
             raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        self.download_args.append(ExtraArgs)
         Path(Filename).write_bytes(self.objects[(Bucket, Key)]["Body"])
 
     def delete_object(self, Bucket, Key):
@@ -658,6 +665,37 @@ def test_s3_artifact_store_materializes_file_without_reading_bytes(monkeypatch, 
 
     with pytest.raises(ClientError):
         store.read_file("missing.csv.gz", tmp_path / "missing.csv.gz")
+
+
+def test_s3_artifact_store_reports_object_identity_and_pins_materialized_version(monkeypatch, tmp_path):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "outputs/daily.csv.gz")] = {
+        "Body": b"compressed-bars",
+        "ETag": '"abc123"',
+        "VersionId": "v-7",
+        "LastModified": datetime(2026, 9, 28, 5, 45, tzinfo=UTC),
+        "ContentType": "application/gzip",
+    }
+    backend.objects[("bucket", "outputs/unversioned.csv.gz")] = {"Body": b"bars"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    identity = store.head("daily.csv.gz")
+    result = store.read_file("daily.csv.gz", tmp_path / "daily.csv.gz")
+    store.read_file("unversioned.csv.gz", tmp_path / "unversioned.csv.gz")
+
+    assert identity == {
+        "bucket": "bucket",
+        "object": "outputs/daily.csv.gz",
+        "etag": '"abc123"',
+        "version_id": "v-7",
+        "size": 15,
+        "last_modified": "2026-09-28T05:45:00+00:00",
+        "content_type": "application/gzip",
+    }
+    assert result == {**identity, "path": str(tmp_path / "daily.csv.gz"), "status": "materialized"}
+    assert backend.download_args == [{"VersionId": "v-7"}, None]
 
 
 def test_s3_atomic_write_does_not_publish_manifest_when_copy_fails(monkeypatch):

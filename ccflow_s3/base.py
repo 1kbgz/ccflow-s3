@@ -485,8 +485,11 @@ class S3ArtifactStore(BaseModel):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         identity = self.head(key)
         # Pin the download to the version that head() identified so the returned identity describes the bytes on disk.
+        # Pinned reads need s3:GetObjectVersion on AWS in addition to s3:GetObject.
         extra_args = {"VersionId": identity["version_id"]} if identity["version_id"] else None
         self.client.client.download_file(Bucket=self.bucket, Key=self.object_key(key), Filename=str(output_path), ExtraArgs=extra_args)
+        if not identity["version_id"] and self.head(key)["etag"] != identity["etag"]:
+            raise RuntimeError(f"{self.artifact_uri(key)} changed during download; its identity no longer matches the downloaded bytes")
         return {
             **identity,
             "path": str(output_path),

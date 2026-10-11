@@ -1,6 +1,12 @@
 __version__ = "0.1.1"
 
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .base import *
+
+
 def __getattr__(name: str) -> object:
     # Submodules are imported on first access so that lerna can locate
     # ccflow_s3.config without importing ccflow

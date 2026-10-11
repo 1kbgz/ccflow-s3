@@ -287,7 +287,7 @@ def test_s3_model_atomic_write_copy_failure_preserves_existing_target_and_skips_
     def fail_copy_object(Bucket, Key, CopySource, ContentType=None):
         raise ClientError({"Error": {"Code": "InternalError", "Message": "copy failed"}}, "CopyObject")
 
-    backend.copy_object = fail_copy_object
+    monkeypatch.setattr(backend, "copy_object", fail_copy_object)
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
     model = S3Model(
         client=S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret")),

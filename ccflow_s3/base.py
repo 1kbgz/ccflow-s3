@@ -279,6 +279,40 @@ class S3Client(BaseModel):
         credentials = self._credentials()
         return self.config.create_config(unsigned=bool(credentials and credentials.is_anonymous))
 
+    def _frozen_credentials(self) -> Any | None:
+        resolved = self.create_session(region_name=self.resolved_region_name()).get_credentials()
+        return resolved.get_frozen_credentials() if resolved is not None else None
+
+    def fsspec_storage_options(self) -> dict[str, Any]:
+        """Options for an fsspec ``s3://`` filesystem (s3fs) that reaches the same endpoint with the same credentials."""
+        client_kwargs = {
+            key: value for key, value in {"endpoint_url": self.resolved_endpoint_url(), "region_name": self.resolved_region_name()}.items() if value
+        }
+        credentials = self._credentials()
+        if credentials and credentials.is_anonymous:
+            return {"anon": True, "client_kwargs": client_kwargs}
+        frozen = self._frozen_credentials()
+        options: dict[str, Any] = {"client_kwargs": client_kwargs}
+        if frozen is not None:
+            options.update(
+                {key: value for key, value in {"key": frozen.access_key, "secret": frozen.secret_key, "token": frozen.token}.items() if value}
+            )
+        return options
+
+    def polars_storage_options(self) -> dict[str, str]:
+        """Options for Polars' native ``s3://`` reader that reach the same endpoint with the same credentials."""
+        credentials = self._credentials()
+        options = {"aws_endpoint_url": self.resolved_endpoint_url(), "aws_region": self.resolved_region_name()}
+        if credentials and credentials.is_anonymous:
+            options["aws_skip_signature"] = "true"
+        else:
+            frozen = self._frozen_credentials()
+            if frozen is not None:
+                options.update(
+                    {"aws_access_key_id": frozen.access_key, "aws_secret_access_key": frozen.secret_key, "aws_session_token": frozen.token}
+                )
+        return {key: value for key, value in options.items() if value}
+
     @property
     def client(self):
         region_name = self.resolved_region_name()
@@ -429,6 +463,16 @@ class S3ArtifactStore(BaseModel):
 
     def artifact_uri(self, key: str) -> str:
         return f"s3://{self.bucket}/{self.object_key(key)}"
+
+    def fsspec_url(self, key: str) -> str:
+        """The fsspec URL of an artifact, readable with ``storage_options()``."""
+        return self.artifact_uri(key)
+
+    def storage_options(self) -> dict[str, Any]:
+        return self.client.fsspec_storage_options()
+
+    def polars_storage_options(self) -> dict[str, str]:
+        return self.client.polars_storage_options()
 
     def exists(self, key: str) -> bool:
         try:

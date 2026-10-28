@@ -792,3 +792,49 @@ def test_get_object_bytes_raises_after_exhausting_retries(monkeypatch):
     with pytest.raises(ResponseStreamingError):
         s3_base._get_object_bytes(FakeBoto(), Bucket="b", Key="k")
     assert len(calls) == 5
+
+
+def test_s3_storage_options_reach_the_same_endpoint_with_the_same_credentials(monkeypatch):
+    from ccflow_s3.base import S3ArtifactStore, S3Client, S3ClientCredentials, S3Provider
+
+    monkeypatch.setenv("TEST_S3_KEY_ID", "key-id")
+    monkeypatch.setenv("TEST_S3_SECRET", "secret")
+    client = S3Client(
+        provider=S3Provider(name="backblaze", region_name="us-west-004"),
+        credentials=S3ClientCredentials(mode="env", access_key_id_env="TEST_S3_KEY_ID", secret_access_key_env="TEST_S3_SECRET"),
+    )
+    store = S3ArtifactStore(client=client, bucket="shared", prefix="data")
+
+    assert store.fsspec_url("curated/x/2025-01-02.parquet") == "s3://shared/data/curated/x/2025-01-02.parquet"
+    assert store.storage_options() == {
+        "key": "key-id",
+        "secret": "secret",
+        "client_kwargs": {"endpoint_url": "https://s3.us-west-004.backblazeb2.com", "region_name": "us-west-004"},
+    }
+    assert store.polars_storage_options() == {
+        "aws_endpoint_url": "https://s3.us-west-004.backblazeb2.com",
+        "aws_region": "us-west-004",
+        "aws_access_key_id": "key-id",
+        "aws_secret_access_key": "secret",
+    }
+
+
+def test_s3_storage_options_for_anonymous_access():
+    from ccflow_s3.base import S3Client, S3ClientCredentials
+
+    client = S3Client(endpoint_url="https://example.test", credentials=S3ClientCredentials(mode="anonymous"))
+
+    assert client.fsspec_storage_options() == {"anon": True, "client_kwargs": {"endpoint_url": "https://example.test"}}
+    assert client.polars_storage_options() == {"aws_endpoint_url": "https://example.test", "aws_skip_signature": "true"}
+
+
+def test_s3_storage_options_without_resolved_credentials(monkeypatch):
+    from boto3.session import Session
+
+    from ccflow_s3.base import S3Client, S3ClientCredentials
+
+    monkeypatch.setattr(Session, "get_credentials", lambda self: None)
+    client = S3Client(endpoint_url="https://example.test", region_name="us-east-1", credentials=S3ClientCredentials(mode="default"))
+
+    assert client.fsspec_storage_options() == {"client_kwargs": {"endpoint_url": "https://example.test", "region_name": "us-east-1"}}
+    assert client.polars_storage_options() == {"aws_endpoint_url": "https://example.test", "aws_region": "us-east-1"}

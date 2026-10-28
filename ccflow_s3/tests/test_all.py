@@ -826,3 +826,15 @@ def test_s3_storage_options_for_anonymous_access():
 
     assert client.fsspec_storage_options() == {"anon": True, "client_kwargs": {"endpoint_url": "https://example.test"}}
     assert client.polars_storage_options() == {"aws_endpoint_url": "https://example.test", "aws_skip_signature": "true"}
+
+
+def test_s3_storage_options_without_resolved_credentials(monkeypatch):
+    from boto3.session import Session
+
+    from ccflow_s3.base import S3Client, S3ClientCredentials
+
+    monkeypatch.setattr(Session, "get_credentials", lambda self: None)
+    client = S3Client(endpoint_url="https://example.test", region_name="us-east-1", credentials=S3ClientCredentials(mode="default"))
+
+    assert client.fsspec_storage_options() == {"client_kwargs": {"endpoint_url": "https://example.test", "region_name": "us-east-1"}}
+    assert client.polars_storage_options() == {"aws_endpoint_url": "https://example.test", "aws_region": "us-east-1"}

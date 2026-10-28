@@ -280,9 +280,6 @@ class S3Client(BaseModel):
         return self.config.create_config(unsigned=bool(credentials and credentials.is_anonymous))
 
     def _frozen_credentials(self) -> Any | None:
-        credentials = self._credentials()
-        if credentials and credentials.is_anonymous:
-            return None
         resolved = self.create_session(region_name=self.resolved_region_name()).get_credentials()
         return resolved.get_frozen_credentials() if resolved is not None else None
 

@@ -631,6 +631,22 @@ def test_s3_artifact_store_lists_every_inventory_page(monkeypatch):
     assert len(backend.list_calls) == 2
 
 
+def test_s3_artifact_store_lists_object_identities(monkeypatch):
+    backend = FakeS3Backend()
+    backend.objects[("bucket", "outputs/daily/AAA.json")] = {"Body": b"{}", "ETag": '"aaa"'}
+    backend.objects[("bucket", "outputs/daily/BBB.json")] = {"Body": b"[1]", "ETag": '"bbb"'}
+    backend.objects[("bucket", "outputs/other.json")] = {"Body": b"{}"}
+    monkeypatch.setattr(S3Client, "client", property(lambda self: backend))
+    client = S3Client(endpoint_url="https://s3.example.test", session=S3Session(aws_access_key_id="key", aws_secret_access_key="secret"))
+    store = S3ArtifactStore(client=client, bucket="bucket", prefix="outputs")
+
+    assert store.list_objects("daily") == {
+        "daily/AAA.json": {"etag": '"aaa"', "size": 2, "last_modified": None},
+        "daily/BBB.json": {"etag": '"bbb"', "size": 3, "last_modified": None},
+    }
+    assert len(backend.list_calls) == 1
+
+
 def test_s3_artifact_store_writes_local_file(monkeypatch, tmp_path):
     backend = FakeS3Backend()
     monkeypatch.setattr(S3Client, "client", property(lambda self: backend))

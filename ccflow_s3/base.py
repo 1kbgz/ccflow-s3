@@ -485,11 +485,15 @@ class S3ArtifactStore(BaseModel):
         return True
 
     def list_keys(self, prefix: str = "") -> list[str]:
+        return sorted(self.list_objects(prefix))
+
+    def list_objects(self, prefix: str = "") -> dict[str, dict[str, Any]]:
+        """Every key under ``prefix`` with the ETag, size, and modification time the listing reports, without a request per object."""
         object_prefix = self.object_key(prefix)
         configured_prefix = self.prefix.strip("/")
         if not prefix and configured_prefix:
             object_prefix = f"{configured_prefix}/"
-        keys = []
+        objects = {}
         continuation_token = None
         while True:
             kwargs = {"Bucket": self.bucket, "Prefix": object_prefix}
@@ -500,13 +504,18 @@ class S3ArtifactStore(BaseModel):
                 object_key = str(item["Key"])
                 if configured_prefix:
                     object_key = object_key.removeprefix(f"{configured_prefix}/")
-                keys.append(object_key)
+                last_modified = item.get("LastModified")
+                objects[object_key] = {
+                    "etag": item.get("ETag"),
+                    "size": item.get("Size"),
+                    "last_modified": last_modified.isoformat() if last_modified is not None else None,
+                }
             if not response.get("IsTruncated"):
                 break
             continuation_token = response.get("NextContinuationToken")
             if not continuation_token:
                 break
-        return sorted(keys)
+        return dict(sorted(objects.items()))
 
     def read(self, key: str) -> bytes:
         return _get_object_bytes(self.client.client, Bucket=self.bucket, Key=self.object_key(key))

@@ -854,3 +854,17 @@ def test_s3_storage_options_without_resolved_credentials(monkeypatch):
 
     assert client.fsspec_storage_options() == {"client_kwargs": {"endpoint_url": "https://example.test", "region_name": "us-east-1"}}
     assert client.polars_storage_options() == {"aws_endpoint_url": "https://example.test", "aws_region": "us-east-1"}
+
+
+def test_s3_secret_fields_are_omitted_from_repr():
+    session = S3Session(
+        aws_access_key_id="key-id-value", aws_secret_access_key="secret-value", aws_session_token="token-value", profile_name="analytics"
+    )
+    credentials = S3ClientCredentials(mode="access_key", access_key_id="key-id-value", secret_access_key="secret-value", session_token="token-value")
+    client = S3Client(endpoint_url="https://s3.example.test", session=session, credentials=credentials)
+
+    for value in (session, credentials, client):
+        for secret in ("key-id-value", "secret-value", "token-value"):
+            assert secret not in repr(value)
+            assert secret not in str(value)
+    assert "analytics" in repr(session)

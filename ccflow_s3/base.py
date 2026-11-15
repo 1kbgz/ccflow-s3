@@ -218,9 +218,9 @@ class S3Provider(BaseModel):
 
 class S3Session(BaseModel):
     credentials: APIKeySecretCredentials | None = None
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    aws_session_token: str | None = None
+    aws_access_key_id: str | None = Field(default=None, repr=False)
+    aws_secret_access_key: str | None = Field(default=None, repr=False)
+    aws_session_token: str | None = Field(default=None, repr=False)
     profile_name: str | None = None
     region_name: str | None = None
 
